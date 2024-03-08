@@ -11,6 +11,7 @@
 #include <mma.h>
 #include <cuda.h>
 #include <ptx.h>
+#include <cuda_pipeline.h>
 
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
@@ -30,14 +31,20 @@ using Reg4 = uint32_t[4];
 using Reg2 = uint32_t[2];
 
 __device__ void load_shm_A(half* shm_A, half* A, int M, int K, int ki, int mi) {
-    *((float4*)OFFSET(shm_A, mi * 32 + threadIdx.x, 0, 8)) = 
-        *(float4*)(OFFSET(A, blockIdx.x * BLK_M + mi * 16 + threadIdx.x % 16, ki * BLK_K + threadIdx.x / 16 * 8, K));
+    __pipeline_memcpy_async(
+        ((float4*)OFFSET(shm_A, mi * 32 + threadIdx.x, 0, 8)),
+        (float4*)(OFFSET(A, blockIdx.x * BLK_M + mi * 16 + threadIdx.x % 16, ki * BLK_K + threadIdx.x / 16 * 8, K)),
+        16
+    );
 }
 
 __device__ void load_shm_B(half* shm_B, half* B, int N, int K, int ki, int ni) {
     ni = ni / 2;
-    *((float4*)OFFSET(shm_B, ni * 32 + threadIdx.x, 0, 8)) = 
-        *(float4*)(OFFSET(B, ki * BLK_K + threadIdx.x % 16, blockIdx.y * BLK_N + ni * 16 + threadIdx.x / 16 * 8, N));
+    __pipeline_memcpy_async(
+        ((float4*)OFFSET(shm_B, ni * 32 + threadIdx.x, 0, 8)),
+        (float4*)(OFFSET(B, ki * BLK_K + threadIdx.x % 16, blockIdx.y * BLK_N + ni * 16 + threadIdx.x / 16 * 8, N)),
+        16
+    );
 }
 
 __device__ void load_reg_A(Reg4* reg_A, half* shm_A, int mi) {
@@ -66,44 +73,61 @@ __device__ void store_C(Reg4* reg_C, half* C, int N) {
     }
 }
 
+__device__ void pipe_load(half* d_A, half* d_B, half* shm_A, half* shm_B, int M, int N, int K, int ki) {
+    shm_A += (ki & 1) * BLK_M * BLK_K;
+    shm_B += (ki & 1) * BLK_N * BLK_K;
+    
+    for (int mi = 0; mi < WARP_M / MMA_M; mi++) {
+        load_shm_A(shm_A, d_A, M, K, ki, mi);
+    }
+
+    for (int ni = 0; ni < WARP_N / MMA_N; ni += 2) {
+        load_shm_B(shm_B, d_B, N, K, ki, ni);
+    }
+}
+
+__device__ void pipe_calc(half* shm_A, half* shm_B, Reg4* reg_A, Reg2* reg_B, Reg4* reg_C, int ki) {
+    shm_A += (ki & 1) * BLK_M * BLK_K;
+    shm_B += (ki & 1) * BLK_N * BLK_K;
+
+    for (int mi = 0; mi < WARP_M / MMA_M; mi++) {
+        load_reg_A(reg_A, shm_A, mi);
+    }
+
+    for (int ni = 0; ni < WARP_N / MMA_N; ni++) {
+        load_reg_B(reg_B, shm_B, ni);
+    }
+
+    for (int m = 0; m < WARP_M / MMA_M; m++) {
+        for (int n = 0; n < WARP_N / MMA_N; n++) {
+            int idx = m * WARP_N / MMA_N + n;
+            HMMA16816(reg_C[idx][0], reg_C[idx][1], reg_C[idx][2], reg_C[idx][3],
+                      reg_A[m][0], reg_A[m][1], reg_A[m][2], reg_A[m][3],
+                      reg_B[n][0], reg_B[n][1], 
+                      reg_C[idx][0], reg_C[idx][1], reg_C[idx][2], reg_C[idx][3]);       
+        } 
+    }
+}
+
 __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d_C) {
-    __shared__ half shm_A[BLK_M * BLK_K]; // [2 * BLK_M, 8]
-    __shared__ half shm_B[BLK_N * BLK_K]; // [2 * BLK_N, 8]
+    __shared__ half shm_A[2 * BLK_M * BLK_K]; // [2 * BLK_M, 8]
+    __shared__ half shm_B[2 * BLK_N * BLK_K]; // [2 * BLK_N, 8]
 
     Reg4 reg_A[WARP_M/MMA_M];
     Reg2 reg_B[WARP_N/MMA_N];
     Reg4 reg_C[WARP_M/MMA_M * WARP_N/MMA_N] = {0};
 
-    for (int k = 0; k < K / MMA_K; k++) {
-        for (int mi = 0; mi < WARP_M / MMA_M; mi++) {
-            load_shm_A(shm_A, d_A, M, K, k, mi);
-        }
+    pipe_load(d_A, d_B, shm_A, shm_B, M, N, K, 0);
+    __pipeline_commit();
 
-        for (int ni = 0; ni < WARP_N / MMA_N; ni += 2) {
-            load_shm_B(shm_B, d_B, N, K, k, ni);
-        }
-
-        __syncthreads();
-
-        for (int mi = 0; mi < WARP_M / MMA_M; mi++) {
-            load_reg_A(reg_A, shm_A, mi);
-        }
-
-        for (int ni = 0; ni < WARP_N / MMA_N; ni++) {
-            load_reg_B(reg_B, shm_B, ni);
-        }
-
-        for (int m = 0; m < WARP_M / MMA_M; m++) {
-            for (int n = 0; n < WARP_N / MMA_N; n++) {
-                int idx = m * WARP_N / MMA_N + n;
-                HMMA16816(reg_C[idx][0], reg_C[idx][1], reg_C[idx][2], reg_C[idx][3],
-                          reg_A[m][0], reg_A[m][1], reg_A[m][2], reg_A[m][3],
-                          reg_B[n][0], reg_B[n][1], 
-                          reg_C[idx][0], reg_C[idx][1], reg_C[idx][2], reg_C[idx][3]);       
-            } 
-        }
-        __syncthreads();
+    for (int k = 1; k < K / MMA_K; k++) {
+        pipe_load(d_A, d_B, shm_A, shm_B, M, N, K, k);
+        __pipeline_commit();
+        __pipeline_wait_prior(1);
+        pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, k - 1);
     }
+    __pipeline_wait_prior(0);
+    pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, K / MMA_K - 1);
 
     store_C(reg_C, d_C, N);
 }

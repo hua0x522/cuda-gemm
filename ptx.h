@@ -6,6 +6,9 @@
 #define LDMATRIX_X2(R0, R1, addr) \
     asm volatile("ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n" : "=r"(R0), "=r"(R1) : "r"(addr))
 
+#define LDMATRIX_X2_T(R0, R1, addr) \
+    asm volatile("ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {%0, %1}, [%2];\n" : "=r"(R0), "=r"(R1) : "r"(addr))
+
 #define LDMATRIX_X4(R0, R1, R2, R3, addr)                                             \
     asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n" \
                  : "=r"(R0), "=r"(R1), "=r"(R2), "=r"(R3)                             \

@@ -15,6 +15,7 @@ half* random_data(int size) {
     for (int i = 0; i < size; i++) {
         handle[i] = sign * (1.0 * (i % 10)) / 10.0;
         sign = -sign;
+        // handle[i] = 1.0 * i / 100;
     }
     return handle;
 }
@@ -36,13 +37,19 @@ half* copy_data(half* data, int size) {
 }
 
 void transpose(half* matrix, int m, int n) {
+    half* new_matrix = (half*)malloc(m * n * sizeof(half));
+
     for (int i = 0; i < m; i++) {
-        for (int j = 0; j < i; j++) {
-            half temp = matrix[i * n + j];
-            matrix[i * n + j] = matrix[j * n + i];
-            matrix[j * n + i] = temp;
+        for (int j = 0; j < n; j++) {
+            new_matrix[j * m + i] = matrix[i * n + j];
         }
     }
+
+    for (int i = 0; i < m * n; i++) {
+        matrix[i] = new_matrix[i];
+    }
+
+    free(new_matrix);
 }
 
 void check(half* A, half* B, int size) {
@@ -74,7 +81,7 @@ int main(int argc, char* argv[]) {
     half* h_B = random_data(k * n);
     half* h_C = empty_data(m * n);
     half* B = copy_data(h_B, k * n);
-    transpose(B, k, n);
+    // transpose(B, k, n);
     half* C = empty_data(m * n);
 
     baseline(m, n, k, h_A, h_B, h_C);

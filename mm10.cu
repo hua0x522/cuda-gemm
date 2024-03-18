@@ -7,7 +7,7 @@
 #include <cuda_pipeline.h>
 
 #define BLK_M 128
-#define BLK_N 64
+#define BLK_N 128
 #define BLK_K 32
 #define WARP_M 64
 #define WARP_N 64
@@ -18,21 +18,19 @@
 
 #define cdiv(x, y) (((x) + (y) - 1) / (y))
 
-using FA = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, MMA_M, MMA_N, MMA_K, half, nvcuda::wmma::row_major>;
-using FB = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, MMA_M, MMA_N, MMA_K, half, nvcuda::wmma::row_major>;
-using FC = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, MMA_M, MMA_N, MMA_K, float>;
+using FragA = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, MMA_M, MMA_N, MMA_K, half, nvcuda::wmma::row_major>;
+using FragB = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, MMA_M, MMA_N, MMA_K, half, nvcuda::wmma::row_major>;
+using Accum = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, MMA_M, MMA_N, MMA_K, float>;
 
-__device__ void loadSmemA(half *smem, half *A, int M, int K, int ko)
+__device__ void load_shm_A(half *shm_A, half *A, int M, int K, int ko)
 {
     // load BLK_M * BLK_K
+    // layout: [row_out, col_out, row_in, col_in] = [BLK_M / 16, BLK_K / 16, 16, 16]
     int tid = threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x;
-    for (int i = 0; i < (BLK_M * BLK_K) / (8 * num_threads); ++i)
-    {
+    for (int i = 0; i < (BLK_M * BLK_K) / (8 * num_threads); ++i) {
         int row = i * (8 * num_threads / BLK_K) + tid / (BLK_K / 8);
         int col = tid % (BLK_K / 8) * 8;
-        // layout: [row_out, col_out, row_in, col_in] = [BLK_M / 16, BLK_K / 16, 16, 16]
-
-        void *ptr = (void *)(smem + row / 16 * ((BLK_K / 16) * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
+        void *ptr = (void *)(shm_A + row / 16 * ((BLK_K / 16) * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
 
         __pipeline_memcpy_async(
             ptr,
@@ -42,17 +40,15 @@ __device__ void loadSmemA(half *smem, half *A, int M, int K, int ko)
     }
 }
 
-__device__ void loadSmemB(half *smem, half *B, int N, int K, int ko)
+__device__ void load_shm_B(half *shm_B, half *B, int N, int K, int ko)
 {
     // load BLK_K * BLK_N
+    // layout: [row_out, col_out, row_in, col_in] = [BLK_K / 16, BLK_N / 16, 16, 16]
     int tid = threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x;
-    for (int i = 0; i < (BLK_K * BLK_N) / (8 * num_threads); ++i)
-    {
+    for (int i = 0; i < (BLK_K * BLK_N) / (8 * num_threads); ++i) {
         int row = i * (8 * num_threads / BLK_N) + tid / (BLK_N / 8);
         int col = tid % (BLK_N / 8) * 8;
-        // layout: [row_out, col_out, row_in, col_in] = [BLK_K / 16, BLK_N / 16, 16, 16]
-
-        void *ptr = (void *)(smem + row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
+        void *ptr = (void *)(shm_B + row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
 
         __pipeline_memcpy_async(
             ptr,
@@ -63,42 +59,42 @@ __device__ void loadSmemB(half *smem, half *B, int N, int K, int ko)
     }
 }
 
-__device__ void storeSmemC(half *C, float *smem, int M, int N)
+__device__ void store_shm_C(half *C, float *shm_C, int M, int N)
 {
     // load BLK_M * BLK_N
     int tid = threadIdx.z * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x;
     for (int i = 0; i < (BLK_M * BLK_N) / num_threads; i++) {
-        int row = i * (num_threads / BLK_N) + tid / BLK_N;
-        int col = tid % BLK_N;
+        int row = i * num_threads / BLK_N + tid / BLK_N;
+        int col = i * num_threads % BLK_N + tid % BLK_N;
         C[(blockIdx.y * BLK_M + row) * N + blockIdx.x * BLK_N + col] = 
-            (half)smem[row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16];
+            (half)shm_C[row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16];
     }
 }
 
-__device__ void loadFragA(FA *frag, half *smem, int ki)
+__device__ void load_frag_A(FragA *frag, half *shm_A, int ki)
 {
     // load WARP_M * WARP_K
     for (int i = 0; i < WARP_M / MMA_M; ++i)
     {
         int row = threadIdx.z * WARP_M + i * MMA_M;
         int col = ki * MMA_K;
-        nvcuda::wmma::load_matrix_sync(frag[i], smem + row / 16 * ((BLK_K / 16) * 16 * 16) + col / 16 * (16 * 16), 16);
+        nvcuda::wmma::load_matrix_sync(frag[i], shm_A + row / 16 * ((BLK_K / 16) * 16 * 16) + col / 16 * (16 * 16), 16);
     }
 }
 
-__device__ void loadFragB(FB *frag, half *smem, int ki)
+__device__ void load_frag_B(FragB *frag, half *shm_B, int ki)
 {
     // load WARP_K * WARP_N
     for (int i = 0; i < WARP_N / MMA_N; ++i)
     {
         int row = ki * MMA_K; 
         int col = threadIdx.y * WARP_N + i * MMA_N;
-        nvcuda::wmma::load_matrix_sync(frag[i], smem + row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16), 16);
+        nvcuda::wmma::load_matrix_sync(frag[i], shm_B + row / 16 * ((BLK_N / 16) * 16 * 16) + col / 16 * (16 * 16), 16);
     }
     __syncthreads();
 }
 
-__device__ void storeAccum(float *ptr, FC *frag)
+__device__ void store_Accum(float *ptr, Accum *frag)
 {
     // store 64x64
     for (int i = 0; i < WARP_M / MMA_M; ++i)
@@ -117,24 +113,24 @@ __device__ void storeAccum(float *ptr, FC *frag)
 __device__ void pipe_load(half* shm_A, half* shm_B, half* A, half* B, int M, int N, int K, int ko) {
     shm_A += (ko % 4) * BLK_M * BLK_K;
     shm_B += (ko % 4) * BLK_N * BLK_K;
-    loadSmemA(shm_A, A, M, K, ko);
-    loadSmemB(shm_B, B, N, K, ko);
+    load_shm_A(shm_A, A, M, K, ko);
+    load_shm_B(shm_B, B, N, K, ko);
 }
 
-__device__ void pipe_calc(FA* FragA, FB* FragB, FC* Accum, half* shm_A, half* shm_B, int ko) {
+__device__ void pipe_calc(FragA* frag_A, FragB* frag_B, Accum* accum, half* shm_A, half* shm_B, int ko) {
     shm_A += (ko % 4) * BLK_M * BLK_K;
     shm_B += (ko % 4) * BLK_N * BLK_K;
     for (int ki = 0; ki < BLK_K / MMA_K; ki += 1)
     {
         // 64x64x16 mma for each warp
-        loadFragA(FragA, shm_A, ki);
-        loadFragB(FragB, shm_B, ki);
+        load_frag_A(frag_A, shm_A, ki);
+        load_frag_B(frag_B, shm_B, ki);
         for (int mii = 0; mii < WARP_M / MMA_M; mii += 1)
         {
             for (int nii = 0; nii < WARP_N / MMA_N; nii += 1)
             {
                 // 16x16x16 for each wmma
-                nvcuda::wmma::mma_sync(Accum[mii * (WARP_N / MMA_N) + nii], FragA[mii], FragB[nii], Accum[mii * (WARP_N / MMA_N) + nii]);
+                nvcuda::wmma::mma_sync(accum[mii * (WARP_N / MMA_N) + nii], frag_A[mii], frag_B[nii], accum[mii * (WARP_N / MMA_N) + nii]);
             }
         }
     }
@@ -152,15 +148,15 @@ __global__ void matmul_kernel(int M, int N, int K, half *A, half *B, half *C)
     half* shm_B = shm_A + 4 * BLK_M * BLK_K;
     float *SC = reinterpret_cast<float *>(shared_storage);
 
-    FA FragA[WARP_M / MMA_M];
-    FB FragB[WARP_N / MMA_N];
-    FC Accum[WARP_M / MMA_M * WARP_N / MMA_N];
+    FragA frag_A[WARP_M / MMA_M];
+    FragB frag_B[WARP_N / MMA_N];
+    Accum accum[WARP_M / MMA_M * WARP_N / MMA_N];
 
     for (int mii = 0; mii < WARP_M / MMA_M; mii += 1)
     {
         for (int nii = 0; nii < WARP_N / MMA_N; nii += 1)
         {
-            nvcuda::wmma::fill_fragment(Accum[mii * (WARP_N / MMA_N) + nii], 0.0);
+            nvcuda::wmma::fill_fragment(accum[mii * (WARP_N / MMA_N) + nii], 0.0);
         }
     }
 
@@ -177,23 +173,23 @@ __global__ void matmul_kernel(int M, int N, int K, half *A, half *B, half *C)
         pipe_load(shm_A, shm_B, A, B, M, N, K, ko);
         __pipeline_commit();
         __pipeline_wait_prior(3);
-        pipe_calc(FragA, FragB, Accum, shm_A, shm_B, ko - 3);
+        pipe_calc(frag_A, frag_B, accum, shm_A, shm_B, ko - 3);
         __syncthreads();
     }
 
     __pipeline_wait_prior(2);
-    pipe_calc(FragA, FragB, Accum, shm_A, shm_B, K / BLK_K - 3);
+    pipe_calc(frag_A, frag_B, accum, shm_A, shm_B, K / BLK_K - 3);
     __syncthreads();
     __pipeline_wait_prior(1);
-    pipe_calc(FragA, FragB, Accum, shm_A, shm_B, K / BLK_K - 2);
+    pipe_calc(frag_A, frag_B, accum, shm_A, shm_B, K / BLK_K - 2);
     __syncthreads();
     __pipeline_wait_prior(0);
-    pipe_calc(FragA, FragB, Accum, shm_A, shm_B, K / BLK_K - 1);
+    pipe_calc(frag_A, frag_B, accum, shm_A, shm_B, K / BLK_K - 1);
     __syncthreads();
 
-    storeAccum(SC, Accum);
+    store_Accum(SC, accum);
     __syncthreads();
-    storeSmemC(C, SC, M, N);
+    store_shm_C(C, SC, M, N);
 }
 
 void matmul(int M, int N, int K, half* h_A, half* h_B, half* h_C) {

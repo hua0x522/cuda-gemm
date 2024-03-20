@@ -18,26 +18,27 @@
     block size: [64, 64]
     warp  size: [64, 32]
     warp  num : [ 1,  2]
+    k : 64
 */
 
 __device__ void load_shm_A(half* shm_A, half* A, int M, int K, int ko) {
-    // layout: [64, 16]
+    // layout: [64, 64]
     int tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = 0; i < 2; i++) {
-        int row = i * 32 + tid / 2;
-        int col = tid % 2 * 8;
-        *(float4*)&shm_A[row * 16 + col] = *(float4*)&A[(blockIdx.x * 64 + row) * K + ko * 16 + col];
+    for (int i = 0; i < 8; i++) {
+        int row = i * 8 + tid / 8;
+        int col = tid % 8 * 8;
+        *(float4*)&shm_A[row * 64 + col] = *(float4*)&A[(blockIdx.x * 64 + row) * K + ko * 64 + col];
     }
     __syncthreads();
 }
 
 __device__ void load_shm_B(half* shm_B, half* B, int K, int N, int ko) {
-    // layout: [16, 64]
+    // layout: [64, 64]
     int tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 8; i++) {
         int row = i * 8 + tid / 8;
         int col = tid % 8 * 8;
-        *(float4*)&shm_B[row * 64 + col] = *(float4*)&B[(ko * 16 + row) * N + blockIdx.y * 64 + col];
+        *(float4*)&shm_B[row * 64 + col] = *(float4*)&B[(ko * 64 + row) * N + blockIdx.y * 64 + col];
     }
     __syncthreads();
 }
@@ -53,18 +54,18 @@ __device__ void store_shm_C(float* shm_C, half* C, int M, int N) {
     __syncthreads();
 }
 
-__device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi) {
+__device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi, int ki) {
     int lane_id = threadIdx.x;
-    uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + (mi * 16 + lane_id % 16) * 16 + lane_id / 16 * 8);
+    uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + (mi * 16 + lane_id % 16) * 64 + ki * 16 + lane_id / 16 * 8);
     LDMATRIX_X4(reg_A[0], reg_A[1], reg_A[2], reg_A[3], shm_A_lane_addr);
     __syncthreads();
 
 }
 
-__device__ void load_reg_B(uint32_t* reg_B, half* shm_B) {
+__device__ void load_reg_B(uint32_t* reg_B, half* shm_B, int ki) {
     int lane_id = threadIdx.x;
     for (int ni = 0; ni < 4; ni++) {
-        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + (lane_id % 16) * 64 + threadIdx.y * 32 + ni * 8);
+        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + (ki * 16 + lane_id % 16) * 64 + threadIdx.y * 32 + ni * 8);
         LDMATRIX_X2_T(reg_B[ni * 2], reg_B[ni * 2 + 1], shm_B_lane_addr);
     }
 }
@@ -104,26 +105,26 @@ __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d
     uint32_t reg_C[4 * 4];
     clear_shm_C(shm_C);
 
-    for (int k = 0; k < K / 16; k++) {
+    for (int k = 0; k < K / 64; k++) {
         load_shm_A(shm_A, d_A, M, K, k);
         load_shm_B(shm_B, d_B, K, N, k);
         __syncthreads();
-        
-        load_reg_B(reg_B, shm_B);
 
         for (int m = 0; m < 4; m++) {
-            load_reg_A(reg_A, shm_A, m);
-            clear_reg_C(reg_C);
-            __syncthreads();
-            for (int n = 0; n < 4; n++) {
-                HMMA16816(reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3],
-                          reg_A[0], reg_A[1], reg_A[2], reg_A[3],
-                          reg_B[n * 2], reg_B[n * 2 + 1],
-                          reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3]);
+            for (int ki = 0; ki < 4; ki++) {
+                load_reg_A(reg_A, shm_A, m, ki);
+                load_reg_B(reg_B, shm_B, ki);
+                __syncthreads();
+
+                for (int n = 0; n < 4; n++) {
+                    HMMA16816(reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3],
+                              reg_A[0], reg_A[1], reg_A[2], reg_A[3],
+                              reg_B[n * 2], reg_B[n * 2 + 1],
+                              reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3]);
+                }
             }
             __syncthreads();
             store_reg_C(reg_C, shm_C, m);
-            __syncthreads();
         }
     }
     store_shm_C(shm_C, d_C, M, N);

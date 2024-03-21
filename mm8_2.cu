@@ -27,7 +27,9 @@ __device__ void load_shm_A(half* shm_A, half* A, int M, int K, int ko) {
     for (int i = 0; i < 8; i++) {
         int row = i * 8 + tid / 8;
         int col = tid % 8 * 8;
-        *(float4*)&shm_A[row * 64 + col] = *(float4*)&A[(blockIdx.x * 64 + row) * K + ko * 64 + col];
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 3) << 3);
+        *(float4*)&shm_A[shm_row * 64 + shm_col] = *(float4*)&A[(blockIdx.x * 64 + row) * K + ko * 64 + col];
     }
     __syncthreads();
 }
@@ -38,7 +40,9 @@ __device__ void load_shm_B(half* shm_B, half* B, int K, int N, int ko) {
     for (int i = 0; i < 8; i++) {
         int row = i * 8 + tid / 8;
         int col = tid % 8 * 8;
-        *(float4*)&shm_B[row * 64 + col] = *(float4*)&B[(ko * 64 + row) * N + blockIdx.y * 64 + col];
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 3) << 3);
+        *(float4*)&shm_B[shm_row * 64 + shm_col] = *(float4*)&B[(ko * 64 + row) * N + blockIdx.y * 64 + col];
     }
     __syncthreads();
 }
@@ -49,6 +53,7 @@ __device__ void store_shm_C(float* shm_C, half* C, int M, int N) {
     for (int i = 0; i < 64; i++) {
         int row = i;
         int col = tid;
+        col = col ^ ((row & 3) << 3);
         C[(blockIdx.x * 64 + row) * N + blockIdx.y * 64 + col] = __float2half(shm_C[row * 64 + col]);
     }
     __syncthreads();
@@ -56,7 +61,10 @@ __device__ void store_shm_C(float* shm_C, half* C, int M, int N) {
 
 __device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi, int ki) {
     int lane_id = threadIdx.x;
-    uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + (mi * 16 + lane_id % 16) * 64 + ki * 16 + lane_id / 16 * 8);
+    int row = mi * 16 + lane_id % 16;
+    int col = ki * 16 + lane_id / 16 * 8;
+    col = col ^ ((row & 3) << 3);
+    uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + row * 64 + col);
     LDMATRIX_X4(reg_A[0], reg_A[1], reg_A[2], reg_A[3], shm_A_lane_addr);
     __syncthreads();
 
@@ -64,9 +72,12 @@ __device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi, int ki) {
 
 __device__ void load_reg_B(uint32_t* reg_B, half* shm_B, int ki) {
     int lane_id = threadIdx.x;
+    int row = ki * 16 + lane_id % 16;
+    int col = threadIdx.y * 32;
+    col = col ^ ((row & 3) << 3);
     for (int ni = 0; ni < 4; ni++) {
-        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + (ki * 16 + lane_id % 16) * 64 + threadIdx.y * 32 + ni * 8);
-        LDMATRIX_X2_T(reg_B[ni * 2], reg_B[ni * 2 + 1], shm_B_lane_addr);
+        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * 64 + col + ni * 8);
+        LDMATRIX_X2_T(reg_B[ki * 8 + ni * 2], reg_B[ki * 8 + ni * 2 + 1], shm_B_lane_addr);
     }
 }
 
@@ -74,11 +85,13 @@ __device__ void store_reg_C(uint32_t* reg_C, float* shm_C, int mi) {
     int lane_id = threadIdx.x;
 
     for (int ni = 0; ni < 4; ni++) {
-        int idx = (mi * 16 + lane_id / 4) * 64 + threadIdx.y * 32 + ni * 8 + (lane_id % 4) * 2;
-        shm_C[idx] += *(float*)(&reg_C[ni * 4]);
-        shm_C[idx + 1] += *(float*)(&reg_C[ni * 4 + 1]);
-        shm_C[idx + 8 * 64] += *(float*)(&reg_C[ni * 4 + 2]);
-        shm_C[idx + 8 * 64 + 1] += *(float*)(&reg_C[ni * 4 + 3]);
+        int row = mi * 16 + lane_id / 4;
+        int col = threadIdx.y * 32 + ni * 8 + (lane_id % 4) * 2;
+        col = col ^ ((row & 3) << 3);
+        shm_C[row * 64 + col] += *(float*)(&reg_C[ni * 4]);
+        shm_C[row * 64 + col + 1] += *(float*)(&reg_C[ni * 4 + 1]);
+        shm_C[(row + 8) * 64 + col] += *(float*)(&reg_C[ni * 4 + 2]);
+        shm_C[(row + 8) * 64 + col + 1] += *(float*)(&reg_C[ni * 4 + 3]);
     }
 }
 
@@ -101,7 +114,7 @@ __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d
     __shared__ float shm_C[64 * 64];
 
     uint32_t reg_A[4];
-    uint32_t reg_B[4 * 2];
+    uint32_t reg_B[4 * 4 * 2];
     uint32_t reg_C[4 * 4];
     clear_shm_C(shm_C);
 
@@ -110,10 +123,13 @@ __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d
         load_shm_B(shm_B, d_B, K, N, k);
         __syncthreads();
 
+        for (int ki = 0; ki < 4; ki++) {
+            load_reg_B(reg_B, shm_B, ki);
+        }
+
         for (int m = 0; m < 4; m++) {
             for (int ki = 0; ki < 4; ki++) {
                 load_reg_A(reg_A, shm_A, m, ki);
-                load_reg_B(reg_B, shm_B, ki);
                 __syncthreads();
 
                 for (int n = 0; n < 4; n++) {

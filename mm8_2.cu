@@ -53,8 +53,9 @@ __device__ void store_shm_C(float* shm_C, half* C, int M, int N) {
     for (int i = 0; i < 64; i++) {
         int row = i;
         int col = tid;
-        col = col ^ ((row & 3) << 3);
-        C[(blockIdx.x * 64 + row) * N + blockIdx.y * 64 + col] = __float2half(shm_C[row * 64 + col]);
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 3) << 3);
+        C[(blockIdx.x * 64 + row) * N + blockIdx.y * 64 + col] = __float2half(shm_C[shm_row * 64 + shm_col]);
     }
     __syncthreads();
 }
@@ -72,11 +73,11 @@ __device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi, int ki) {
 
 __device__ void load_reg_B(uint32_t* reg_B, half* shm_B, int ki) {
     int lane_id = threadIdx.x;
-    int row = ki * 16 + lane_id % 16;
-    int col = threadIdx.y * 32;
-    col = col ^ ((row & 3) << 3);
     for (int ni = 0; ni < 4; ni++) {
-        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * 64 + col + ni * 8);
+        int row = ki * 16 + lane_id % 16;
+        int col = threadIdx.y * 32 + ni * 8;
+        col = col ^ ((row & 3) << 3);
+        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * 64 + col);
         LDMATRIX_X2_T(reg_B[ki * 8 + ni * 2], reg_B[ki * 8 + ni * 2 + 1], shm_B_lane_addr);
     }
 }
@@ -109,8 +110,8 @@ __device__ void clear_reg_C(uint32_t* reg_C) {
 }
 
 __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d_C) {
-    __shared__ half shm_A[64 * 16];
-    __shared__ half shm_B[16 * 64];
+    __shared__ half shm_A[64 * 64];
+    __shared__ half shm_B[64 * 64];
     __shared__ float shm_C[64 * 64];
 
     uint32_t reg_A[4];
@@ -127,7 +128,10 @@ __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d
             load_reg_B(reg_B, shm_B, ki);
         }
 
+        int tid = threadIdx.y * 32 + threadIdx.x;
+
         for (int m = 0; m < 4; m++) {
+            clear_reg_C(reg_C);
             for (int ki = 0; ki < 4; ki++) {
                 load_reg_A(reg_A, shm_A, m, ki);
                 __syncthreads();
@@ -135,7 +139,7 @@ __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d
                 for (int n = 0; n < 4; n++) {
                     HMMA16816(reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3],
                               reg_A[0], reg_A[1], reg_A[2], reg_A[3],
-                              reg_B[n * 2], reg_B[n * 2 + 1],
+                              reg_B[ki * 8 + n * 2], reg_B[ki * 8 + n * 2 + 1],
                               reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3]);
                 }
             }

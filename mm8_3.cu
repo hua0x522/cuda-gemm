@@ -60,15 +60,16 @@ __device__ void store_shm_C(float* shm_C, half* C, int M, int N) {
     __syncthreads();
 }
 
-__device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi, int ki) {
-    int lane_id = threadIdx.x;
-    int row = mi * 16 + lane_id % 16;
-    int col = ki * 16 + lane_id / 16 * 8;
-    col = col ^ ((row & 3) << 3);
-    uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + row * 64 + col);
-    LDMATRIX_X4(reg_A[0], reg_A[1], reg_A[2], reg_A[3], shm_A_lane_addr);
+__device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int mi) {
+    for (int ki = 0; ki < 4; ki++) {
+        int lane_id = threadIdx.x;
+        int row = mi * 16 + lane_id % 16;
+        int col = ki * 16 + lane_id / 16 * 8;
+        col = col ^ ((row & 3) << 3);
+        uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + row * 64 + col);
+        LDMATRIX_X4(reg_A[ki * 4], reg_A[ki * 4 + 1], reg_A[ki * 4 + 2], reg_A[ki * 4 + 3], shm_A_lane_addr);
+    }
     __syncthreads();
-
 }
 
 __device__ void load_reg_B(uint32_t* reg_B, half* shm_B, int ki) {
@@ -98,8 +99,8 @@ __device__ void store_reg_C(uint32_t* reg_C, float* shm_C, int mi) {
 
 __device__ void clear_shm_C(float* shm_C) {
     int tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = 0; i < 64; i++) {
-        shm_C[i * 64 + tid] = 0;
+    for (int i = 0; i < 32; i++) {
+        shm_C[i * 128 + tid] = 0;
     }
 }
 
@@ -114,7 +115,7 @@ __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d
     __shared__ half shm_B[64 * 64];
     __shared__ float shm_C[64 * 64];
 
-    uint32_t reg_A[4];
+    uint32_t reg_A[4 * 4];
     uint32_t reg_B[4 * 2 * 2];
     uint32_t reg_C[2 * 4];
     clear_shm_C(shm_C);
@@ -129,12 +130,11 @@ __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d
 
         for (int m = 0; m < 4; m++) {
             clear_reg_C(reg_C);
+            load_reg_A(reg_A, shm_A, m);
             for (int ki = 0; ki < 4; ki++) {
-                load_reg_A(reg_A, shm_A, m, ki);
-
                 for (int n = 0; n < 2; n++) {
                     HMMA16816(reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3],
-                              reg_A[0], reg_A[1], reg_A[2], reg_A[3],
+                              reg_A[ki * 4], reg_A[ki * 4 + 1], reg_A[ki * 4 + 2], reg_A[ki * 4 + 3],
                               reg_B[ki * 4 + n * 2], reg_B[ki * 4 + n * 2 + 1],
                               reg_C[n * 4], reg_C[n * 4 + 1], reg_C[n * 4 + 2], reg_C[n * 4 + 3]);
                 }

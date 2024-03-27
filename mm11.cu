@@ -20,14 +20,15 @@
 
 __device__ void load_shm_A(half* shm_A, half* A, int M, int K, int ko) {
     // global layout: [128, 32]
-    // shared layout: [64, 72]
+    // shared layout: [64, 64]
     int tid = threadIdx.z * 64 + threadIdx.y * 32 + threadIdx.x;
     for (int i = 0; i < 4; i++) {
         int row = i * 32 + tid / 4;
         int col = tid % 4 * 8;
         int shm_row = row / 2;
         int shm_col = col + (row & 1) * 32;
-        *(float4*)&shm_A[shm_row * 72 + shm_col] = *(float4*)&A[(blockIdx.x * 128 + row) * K + ko * 32 + col];
+        shm_col = shm_col ^ ((shm_row & 3) << 3);
+        *(float4*)&shm_A[shm_row * 64 + shm_col] = *(float4*)&A[(blockIdx.x * 128 + row) * K + ko * 32 + col];
     }
     __syncthreads();
 }
@@ -50,7 +51,8 @@ __device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int ki) {
         int col = ki * 16 + lane_id / 16 * 8;
         int shm_row = row / 2;
         int shm_col = col + (row & 1) * 32;
-        uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + shm_row * 72 + shm_col);
+        shm_col = shm_col ^ ((shm_row & 3) << 3);
+        uint32_t shm_A_lane_addr = __cvta_generic_to_shared(shm_A + shm_row * 64 + shm_col);
         LDMATRIX_X4(reg_A[m * 4], reg_A[m * 4 + 1], reg_A[m * 4 + 2], reg_A[m * 4 + 3], shm_A_lane_addr);
     }
     __syncthreads();
@@ -83,7 +85,7 @@ __device__ void store_C(uint32_t* reg_C, half* C, int M, int N) {
 }
 
 __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d_C) {
-    __shared__ half shm_A[64 * 72];
+    __shared__ half shm_A[64 * 64];
     __shared__ half shm_B[32 * 72];
 
     uint32_t reg_A[4 * 4];

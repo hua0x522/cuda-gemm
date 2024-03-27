@@ -70,11 +70,11 @@ __device__ void load_reg_A(uint32_t* reg_A, half* shm_A, int ki) {
 
 __device__ void load_reg_B(uint32_t* reg_B, half* shm_B, int ki) {
     int lane_id = threadIdx.x;
-    for (int ni = 0; ni < 4; ni++) {
+    for (int ni = 0; ni < 2; ni++) {
         int row = ki * 16 + lane_id % 16;
-        int col = threadIdx.y * 32 + ni * 8;
+        int col = threadIdx.y * 32 + ni * 16 + lane_id / 16 * 8;
         uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * 72 + col);
-        LDMATRIX_X2_T(reg_B[ni * 2], reg_B[ni * 2 + 1], shm_B_lane_addr);
+        LDMATRIX_X4_T(reg_B[ni * 4], reg_B[ni * 4 + 1], reg_B[ni * 4 + 2], reg_B[ni * 4 + 3], shm_B_lane_addr);
     }
 }
 
@@ -95,15 +95,15 @@ __device__ void store_C(uint32_t* reg_C, half* C, int M, int N) {
 }
 
 __device__ void pipe_load(half* shm_A, half* shm_B, half* A, half* B, int M ,int N, int K, int ko) {
-    shm_A += (ko & 1) * 64 * 64;
-    shm_B += (ko & 1) * 32 * 72;
+    shm_A += (ko % 3) * 64 * 64;
+    shm_B += (ko % 3) * 32 * 72;
     load_shm_A(shm_A, A, M, K, ko);
     load_shm_B(shm_B, B, K, N, ko);
 }
 
 __device__ void pipe_calc(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* reg_B, uint32_t* reg_C, int ko) {
-    shm_A += (ko & 1) * 64 * 64;
-    shm_B += (ko & 1) * 32 * 72;
+    shm_A += (ko % 3) * 64 * 64;
+    shm_B += (ko % 3) * 32 * 72;
     for (int ki = 0; ki < 2; ki++) {
         load_reg_A(reg_A, shm_A, ki);
         load_reg_B(reg_B, shm_B, ki);
@@ -121,8 +121,8 @@ __device__ void pipe_calc(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* r
 }
 
 __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d_C) {
-    __shared__ half shm_A[2 * 64 * 64];
-    __shared__ half shm_B[2 * 32 * 72];
+    __shared__ half shm_A[3 * 64 * 64];
+    __shared__ half shm_B[3 * 32 * 72];
 
     uint32_t reg_A[4 * 4];
     uint32_t reg_B[4 * 2];
@@ -130,13 +130,17 @@ __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d
 
     pipe_load(shm_A, shm_B, d_A, d_B, M, N, K, 0);
     __pipeline_commit();
+    pipe_load(shm_A, shm_B, d_A, d_B, M, N, K, 1);
+    __pipeline_commit();
 
-    for (int k = 1; k < K / 32; k++) {
+    for (int k = 2; k < K / 32; k++) {
         pipe_load(shm_A, shm_B, d_A, d_B, M, N, K, k);
         __pipeline_commit();
-        __pipeline_wait_prior(1);
-        pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, k - 1);
+        __pipeline_wait_prior(2);
+        pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, k - 2);
     }
+    __pipeline_wait_prior(1);
+    pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, K / 32 - 2);
     __pipeline_wait_prior(0);
     pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, K / 32 - 1);
     store_C(reg_C, d_C, M, N);

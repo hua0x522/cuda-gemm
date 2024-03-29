@@ -39,13 +39,15 @@ __device__ void load_shm_A(half* shm_A, half* A, int M, int K, int ko) {
 }
 
 __device__ void load_shm_B(half* shm_B, half* B, int K, int N, int ko) {
-    // layout: [32, 72]
+    // layout: [32, 64]
     int tid = threadIdx.z * 64 + threadIdx.y * 32 + threadIdx.x;
     for (int i = 0; i < 2; i++) {
         int row = i * 16 + tid / 8;
         int col = tid % 8 * 8;
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 7) << 3);
         __pipeline_memcpy_async(
-            &shm_B[row * 72 + col],
+            &shm_B[shm_row * 64 + shm_col],
             &B[(ko * 32 + row) * N + blockIdx.y * 64 + col],
             16
         );
@@ -73,7 +75,9 @@ __device__ void load_reg_B(uint32_t* reg_B, half* shm_B, int ki) {
     for (int ni = 0; ni < 2; ni++) {
         int row = ki * 16 + lane_id % 16;
         int col = threadIdx.y * 32 + ni * 16 + lane_id / 16 * 8;
-        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + row * 72 + col);
+        int shm_row = row;
+        int shm_col = col ^ ((shm_row & 7) << 3);
+        uint32_t shm_B_lane_addr = __cvta_generic_to_shared(shm_B + shm_row * 64 + shm_col);
         LDMATRIX_X4_T(reg_B[ni * 4], reg_B[ni * 4 + 1], reg_B[ni * 4 + 2], reg_B[ni * 4 + 3], shm_B_lane_addr);
     }
 }
@@ -122,7 +126,7 @@ __device__ void pipe_calc(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* r
 
 __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d_C) {
     __shared__ half shm_A[3 * 64 * 64];
-    __shared__ half shm_B[3 * 32 * 72];
+    __shared__ half shm_B[3 * 32 * 64];
 
     uint32_t reg_A[4 * 4];
     uint32_t reg_B[4 * 2];

@@ -100,14 +100,14 @@ __device__ void store_C(uint32_t* reg_C, half* C, int M, int N) {
 
 __device__ void pipe_load(half* shm_A, half* shm_B, half* A, half* B, int M ,int N, int K, int ko) {
     shm_A += (ko % 3) * 64 * 64;
-    shm_B += (ko % 3) * 32 * 72;
+    shm_B += (ko % 3) * 32 * 64;
     load_shm_A(shm_A, A, M, K, ko);
     load_shm_B(shm_B, B, K, N, ko);
 }
 
 __device__ void pipe_calc(half* shm_A, half* shm_B, uint32_t* reg_A, uint32_t* reg_B, uint32_t* reg_C, int ko) {
     shm_A += (ko % 3) * 64 * 64;
-    shm_B += (ko % 3) * 32 * 72;
+    shm_B += (ko % 3) * 32 * 64;
     for (int ki = 0; ki < 2; ki++) {
         load_reg_A(reg_A, shm_A, ki);
         load_reg_B(reg_B, shm_B, ki);

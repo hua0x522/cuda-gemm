@@ -131,8 +131,8 @@ __global__ void matmul_kernel(int M, int N, int K, half* d_A, half* d_B, half* d
 
     for (int k = 1; k < K / 64; k++) {
         pipe_load(shm_A, shm_B, d_A, d_B, M, N, K, k);
+        __pipeline_wait_prior(0);
         __pipeline_commit();
-        __pipeline_wait_prior(1);
         pipe_calc(shm_A, shm_B, reg_A, reg_B, reg_C, k-1);
     }
 
